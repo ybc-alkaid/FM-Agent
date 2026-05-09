@@ -12,19 +12,34 @@ from .trace_writer import (
 _openrouter_client = OpenAI(api_key=LLM_OPENROUTER_API_KEY, base_url=LLM_OPENROUTER_API_BASE_URL)
 
 _MAX_RATE_LIMIT_RETRIES = 20
+_MAX_LLM_RETRIES = 5
 
 
 def _retry_create(client, model, messages):
-    for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+    rate_limit_attempts = 0
+    transient_attempts = 0
+    while True:
         try:
             response = client.chat.completions.create(model=model, messages=messages)
             return response.choices[0].message.content
         except BadRequestError:
             raise
-        except RateLimitError:
-            wait = min(2 ** attempt * 5, 300) + random.uniform(1, 10)
+        except RateLimitError as exc:
+            rate_limit_attempts += 1
+            if rate_limit_attempts >= _MAX_RATE_LIMIT_RETRIES:
+                raise RuntimeError(
+                    f"Rate limited after {_MAX_RATE_LIMIT_RETRIES} retries: {exc}"
+                ) from exc
+            wait = min(2 ** (rate_limit_attempts - 1) * 5, 300) + random.uniform(1, 10)
             time.sleep(wait)
-    raise RuntimeError(f"Rate limited after {_MAX_RATE_LIMIT_RETRIES} retries")
+        except Exception as exc:
+            transient_attempts += 1
+            if transient_attempts >= _MAX_LLM_RETRIES:
+                raise RuntimeError(
+                    f"LLM request failed after {_MAX_LLM_RETRIES} retries: {exc}"
+                ) from exc
+            wait = min(2 ** (transient_attempts - 1) * 5, 60) + random.uniform(1, 3)
+            time.sleep(wait)
 
 
 def _extract_tagged(text, start_tag, end_tag):
