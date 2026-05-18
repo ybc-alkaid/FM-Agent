@@ -57,7 +57,7 @@ else
     curl -fsSL https://opencode.ai/install | bash
 fi
 
-# ---------- oh-my-opencode plugin ----------
+# ---------- oh-my-openagent plugin ----------
 if command -v bunx &>/dev/null; then
     echo "[ok] bun found"
 else
@@ -70,8 +70,8 @@ else
     export BUN_INSTALL="$HOME/.bun"
     export PATH="$BUN_INSTALL/bin:$PATH"
 fi
-echo "[..] installing/updating oh-my-opencode"
-bunx oh-my-opencode install
+echo "[..] installing/updating oh-my-openagent"
+bunx oh-my-openagent install
 
 echo ""
 echo "=== all dependencies installed ==="
