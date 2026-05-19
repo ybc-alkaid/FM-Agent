@@ -78,10 +78,14 @@ def _fmt_tokens(n):
     return str(n)
 
 
-def _fmt_cost(cents):
-    if cents is None:
+def _fmt_cost(usd):
+    if usd is None:
         return "—"
-    return f"${cents:.4f}"
+    a = abs(usd)
+    if a < 1:    return f"${usd:.3f}"
+    if a < 100:  return f"${usd:.2f}"
+    if a < 10000: return f"${usd:.1f}"
+    return f"${usd:.0f}"
 
 
 def _price_for(model):
@@ -399,47 +403,39 @@ def render_tokens(state):
     p = _price_for(state.model_seen or "")
     table = Table(show_header=True, header_style="bold", expand=True, pad_edge=False)
     table.add_column("Source", style="cyan", no_wrap=True)
-    table.add_column("input", justify="right")
+    table.add_column("in:new", justify="right")
+    table.add_column("in:read", justify="right", style="green")
+    table.add_column("in:write", justify="right", style="yellow")
     table.add_column("output", justify="right")
-    table.add_column("c-read", justify="right", style="green")
-    table.add_column("c-write", justify="right", style="yellow")
     table.add_column("cost", justify="right", style="bold")
 
-    # native (verification LLM)
+    def row(label, b):
+        return [
+            label,
+            _fmt_tokens(b.get("input", 0)),
+            _fmt_tokens(b.get("cache_read", 0)),
+            _fmt_tokens(b.get("cache_write", 0)),
+            _fmt_tokens(b.get("output", 0)),
+        ]
+
+    table.add_row(*row("verification", state.totals), _fmt_cost(state.cost_native))
     table.add_row(
-        "verification",
-        _fmt_tokens(state.totals.get("input", 0)),
-        _fmt_tokens(state.totals.get("output", 0)),
-        _fmt_tokens(state.totals.get("cache_read", 0)),
-        _fmt_tokens(state.totals.get("cache_write", 0)),
-        _fmt_cost(state.cost_native),
-    )
-    # opencode-side
-    table.add_row(
-        f"opencode ({state.opencode_calls})",
-        _fmt_tokens(state.opencode_token_totals.get("input", 0)),
-        _fmt_tokens(state.opencode_token_totals.get("output", 0)),
-        _fmt_tokens(state.opencode_token_totals.get("cache_read", 0)),
-        _fmt_tokens(state.opencode_token_totals.get("cache_write", 0)),
+        *row(f"opencode ({state.opencode_calls})", state.opencode_token_totals),
         _fmt_cost(state.opencode_cost),
     )
-    # total
-    total_cost = state.cost_native + state.opencode_cost
+    # TOTAL — sum across both sources; also expose total input in the label
+    sums = {k: state.totals.get(k, 0) + state.opencode_token_totals.get(k, 0)
+            for k in ("input", "cache_read", "cache_write", "output")}
+    in_total = sums["input"] + sums["cache_read"] + sums["cache_write"]
     table.add_row(
-        "[bold]TOTAL[/]",
-        "",
-        "",
-        "",
-        "",
-        f"[bold]{_fmt_cost(total_cost)}[/]",
+        f"[bold]TOTAL[/] [dim](in={_fmt_tokens(in_total)})[/]",
+        _fmt_tokens(sums["input"]),
+        _fmt_tokens(sums["cache_read"]),
+        _fmt_tokens(sums["cache_write"]),
+        _fmt_tokens(sums["output"]),
+        f"[bold]{_fmt_cost(state.cost_native + state.opencode_cost)}[/]",
     )
-    sub = ""
-    if p:
-        sub = (f" [dim]rates: in ${p.get('input_cost_per_token',0)*1e6:.2f}/M  "
-               f"out ${p.get('output_cost_per_token',0)*1e6:.2f}/M  "
-               f"cr ${p.get('cache_read_input_token_cost',0)*1e6:.2f}/M  "
-               f"cw ${p.get('cache_creation_input_token_cost',0)*1e6:.2f}/M[/]")
-    return Panel(table, title=f"Tokens & Cost{sub}", border_style="green")
+    return Panel(table, title="Tokens & Cost", border_style="green")
 
 
 def render_cache(state):
