@@ -1,7 +1,8 @@
-from config import MAX_WORKERS, OPENCODE_BUG_VALIDATION_MODEL
+from config import MAX_WORKERS, OPENCODE_BUG_VALIDATION_MODEL, OPENCODE_MODEL_PROVIDER
 from .parser import parse_input_function
 from .reasoner import reasoner, _parse_spec_conditions, _sanitize_strings
 from .file_utils import is_file_ready
+from .opencode_trace import function_id_from_result_path, run_opencode_traced
 import os
 import re
 import json
@@ -30,6 +31,9 @@ EXT_TO_LANG = {
 }
 
 
+BUG_VALIDATION_MAX_RETRIES = 1
+
+
 def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, work_dir=None, poll_interval=2, spec_proc=None, spec_procs=None, already_processed=None):
     """Continuously watch input_dir for ready files, verify them, and validate bugs."""
     if work_dir is None:
@@ -48,19 +52,22 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
 
     import concurrent.futures
 
-    # Count source files to reason about
+    # Count files that still need verification in this watcher invocation.
     if expected_files is not None:
-        num_functions = sum(
-            1 for f in expected_files
-            if os.path.splitext(f)[1] in EXT_TO_LANG
-        )
+        total_expected = len(expected_files)
+        pending_expected = expected_files - processed
+        num_functions = len(pending_expected)
+        if num_functions == total_expected:
+            print(f"Functions pending verification: {num_functions}")
+        else:
+            print(f"Functions pending verification: {num_functions} of {total_expected}")
     else:
         num_functions = sum(
             1 for root, _, files in os.walk(input_dir)
             for fname in files
             if os.path.splitext(fname)[1] in EXT_TO_LANG
         )
-    print(f"Functions to reason about: {num_functions}")
+        print(f"Functions pending verification: {num_functions}")
 
     logging.info(f"Watching {input_dir} for ready files (poll every {poll_interval}s)...")
     completed_count = 0
@@ -69,6 +76,7 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             reasoning_futures = {}
             validation_futures = {}
+            submitted = set()
 
             while True:
                 # Scan for new ready files
@@ -82,14 +90,16 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
                             continue
                         if file_path in processed:
                             continue
+                        if file_path in submitted:
+                            continue
                         if not is_file_ready(file_path):
                             continue
 
-                        # File is ready and not yet processed
-                        processed.add(file_path)
+                        # File is ready and not yet submitted or processed.
+                        submitted.add(file_path)
                         language = EXT_TO_LANG.get(ext, "C")
                         future = executor.submit(
-                            _verify_single_file, file_path, input_dir, output_dir, language
+                            _verify_single_file, file_path, input_dir, output_dir, language, work_dir
                         )
                         reasoning_futures[future] = file_path
                         logging.info(f"Submitted: {file_path}")
@@ -98,8 +108,10 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
                 done = [f for f in reasoning_futures if f.done()]
                 for future in done:
                     fpath = reasoning_futures.pop(future)
+                    submitted.discard(fpath)
                     try:
                         _, verdict = future.result()
+                        processed.add(fpath)
                         completed_count += 1
                         rel_path = os.path.relpath(fpath, proj_dir) if proj_dir else os.path.relpath(fpath, input_dir)
                         # Submit bug validation for MISMATCH results; defer printing
@@ -177,15 +189,14 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
                                 f"but no files received [SPEC]/[INFO] markers."
                             )
                         else:
-                            # Some functions are missing specs – treat them as correct
+                            # Some functions are missing specs; leave them pending for retry.
                             logging.warning(
                                 f"Spec generation process(es) exited (codes {exit_codes}), "
-                                f"{len(unready)} files missing specs, treating them as correct."
+                                f"{len(unready)} files missing specs, leaving them pending for retry."
                             )
                             for uf in sorted(unready):
-                                completed_count += 1
                                 rel_path = os.path.relpath(uf, proj_dir) if proj_dir else os.path.relpath(uf, input_dir)
-                                print(f"[{completed_count}/{num_functions}] {rel_path}: \033[32m✔\033[0m (no spec)")
+                                print(f"[pending] {rel_path}: no spec yet; will retry")
                         break
 
                 time.sleep(poll_interval)
@@ -212,7 +223,7 @@ def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, wor
     return processed
 
 
-def _verify_single_file(file_path, input_dir, output_dir, language):
+def _verify_single_file(file_path, input_dir, output_dir, language, work_dir=None):
     """Verify a single file and write the result JSON."""
     # Skip if already verified
     rel = os.path.relpath(file_path, input_dir)
@@ -227,46 +238,58 @@ def _verify_single_file(file_path, input_dir, output_dir, language):
         except (json.JSONDecodeError, OSError):
             pass  # re-verify if existing result is corrupted
 
-    func, spec, knowledge = parse_input_function(file_path)
-    if not spec:
-        return file_path, "SKIPPED"
-
-    _, spec_post = _parse_spec_conditions(spec)
-    result = reasoner(func, spec, knowledge, language)
-
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    if "passes the verification" in result:
-        output = {"function": file_path, "verdict": "MATCH", "gaps": None}
-    elif result.startswith("Failed to "):
-        output = {"function": file_path, "verdict": "ERROR", "gaps": None, "error": result}
-    else:
-        stmts = post_cond = reason_text = ""
-        stmts_match = re.search(
-            r"Statements triggering the violation:\n(.*?)\n\nPost-condition:", result, re.DOTALL
-        )
-        post_match = re.search(
-            r"Post-condition:\n(.*?)\n\nReason for violation:", result, re.DOTALL
-        )
-        reason_match = re.search(r"Reason for violation:\n(.*)", result, re.DOTALL)
+    try:
+        func, spec, knowledge = parse_input_function(file_path)
+        if not spec:
+            return file_path, "SKIPPED"
 
-        if stmts_match:
-            stmts = stmts_match.group(1).strip()
-        if post_match:
-            post_cond = post_match.group(1).strip()
-        if reason_match:
-            reason_text = reason_match.group(1).strip()
+        _, spec_post = _parse_spec_conditions(spec)
+        trace_context = None
+        if work_dir:
+            rel_function = os.path.relpath(file_path, input_dir)
+            trace_context = {
+                "trace_dir": os.path.join(work_dir, "trace"),
+                "function_id": os.path.splitext(rel_function)[0].replace(os.sep, "::"),
+                "function_file": os.path.join("extracted_functions", rel_function).replace(os.sep, "/"),
+            }
+        result = reasoner(func, spec, knowledge, language, trace_context=trace_context)
 
-        output = {
-            "function": file_path,
-            "verdict": "MISMATCH",
-            "gaps": {
-                "spec_claim": spec_post or "",
-                "actual_behavior": post_cond,
-                "code_evidence": stmts,
-                "trigger_condition": reason_text,
-            },
-        }
+        if "passes the verification" in result:
+            output = {"function": file_path, "verdict": "MATCH", "gaps": None}
+        elif result.startswith("Failed to "):
+            output = {"function": file_path, "verdict": "ERROR", "gaps": None, "error": result}
+        else:
+            stmts = post_cond = reason_text = ""
+            stmts_match = re.search(
+                r"Statements triggering the violation:\n(.*?)\n\nPost-condition:", result, re.DOTALL
+            )
+            post_match = re.search(
+                r"Post-condition:\n(.*?)\n\nReason for violation:", result, re.DOTALL
+            )
+            reason_match = re.search(r"Reason for violation:\n(.*)", result, re.DOTALL)
+
+            if stmts_match:
+                stmts = stmts_match.group(1).strip()
+            if post_match:
+                post_cond = post_match.group(1).strip()
+            if reason_match:
+                reason_text = reason_match.group(1).strip()
+
+            output = {
+                "function": file_path,
+                "verdict": "MISMATCH",
+                "gaps": {
+                    "spec_claim": spec_post or "",
+                    "actual_behavior": post_cond,
+                    "code_evidence": stmts,
+                    "trigger_condition": reason_text,
+                },
+            }
+    except Exception as exc:
+        logging.exception(f"Verification failed for {file_path}")
+        output = {"function": file_path, "verdict": "ERROR", "gaps": None, "error": str(exc)}
 
     output = _sanitize_strings(output)
     with open(output_path, "w") as f:
@@ -290,6 +313,7 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None):
     elif parts.startswith("fm_agent/logic_verification_results/"):
         parts = parts[len("fm_agent/logic_verification_results/"):]
     bug_id = os.path.splitext(parts)[0].replace(os.sep, "--").replace("/", "--")
+    function_id = function_id_from_result_path(result_json_rel)
 
     # Read the base bug_validator.md
     base_md_path = os.path.join(script_dir, "md", "bug_validator.md")
@@ -314,15 +338,57 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None):
         f.write(prompt_content)
     os.replace(tmp_path, prompt_path)
 
-    log_path = os.path.join(work_dir, "fm_agent.log")
+    command = ["opencode", "run", "--model", f"{OPENCODE_MODEL_PROVIDER}/{OPENCODE_BUG_VALIDATION_MODEL}",
+               "--file", prompt_path,
+               "--", "Follow the instructions in the attached file"]
+    result_relpath = os.path.join("fm_agent", "bug_validation", f"{bug_id}.result.json")
+    result_path = os.path.join(proj_dir, result_relpath)
     try:
-        with open(log_path, "a") as log_file:
-            subprocess.run(
-                ["opencode", "run", "--model", f"openrouter/{OPENCODE_BUG_VALIDATION_MODEL}",
-                 "--file", prompt_path,
-                 "--", "Follow the instructions in the attached file"],
-                cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, check=True,
-                stdout=log_file, stderr=log_file,
+        max_attempts = BUG_VALIDATION_MAX_RETRIES + 1
+        for attempt in range(1, max_attempts + 1):
+            run_failed = False
+            try:
+                run_opencode_traced(
+                    proj_dir=proj_dir,
+                    work_dir=work_dir,
+                    command=command,
+                    stage="bug_validation",
+                    function_ids=[function_id],
+                    input_files=[prompt_filename, result_json_rel],
+                    output_files=[
+                        os.path.join("fm_agent", "bug_validation", f"{bug_id}.md"),
+                        result_relpath,
+                    ],
+                    summary=f"OpenCode bug validation for {bug_id}",
+                    metadata={"bug_id": bug_id, "result_json": result_json_rel},
+                )
+            except subprocess.CalledProcessError as exc:
+                run_failed = True
+                logging.warning(
+                    "bug_validation run failed for %s on attempt %d/%d: %s",
+                    bug_id,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+
+            if os.path.exists(result_path):
+                return
+
+            if attempt < max_attempts:
+                logging.warning(
+                    "bug_validation missing result artifact for %s after attempt %d/%d; retrying once",
+                    bug_id,
+                    attempt,
+                    max_attempts,
+                )
+                continue
+
+            logging.error(
+                "bug_validation did not materialize %s after %d attempt(s)%s",
+                result_relpath,
+                max_attempts,
+                " and a non-zero exit code" if run_failed else "",
             )
     finally:
         try:

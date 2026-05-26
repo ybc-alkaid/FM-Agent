@@ -86,6 +86,7 @@ Key parameters can be adjusted in [config.py](config.py).
 | `OPENCODE_BUG_VALIDATION_MODEL` | `LLM_MODEL`                    | Model used by OpenCode to validate `MISMATCH` results with probe scripts and bug reports |
 | `REASONER_POST_CONDITION_MODEL` | `LLM_MODEL`                    | Model used by direct llm calls to generate block post-conditions |
 | `REASONER_SPEC_CHECK_MODEL`     | `LLM_MODEL`                    | Model used by direct llm calls to check whether actual post-conditions violate specs |
+| `OPENCODE_MODEL_PROVIDER`       | `openrouter`                   | OpenCode provider prefix used when invoking `opencode run --model <prefix>/<model>` |
 | `LLM_OPENROUTER_API_KEY`        | (env)                          | OpenRouter API key (read via `os.environ.get("OPENROUTER_API_KEY")`) |
 | `LLM_OPENROUTER_API_BASE_URL`   | `https://openrouter.ai/api/v1` | OpenRouter API base URL                                      |
 
@@ -97,6 +98,28 @@ You can open your oh-my-openagent config file (typically ~/.config/opencode/oh-m
   "disabled_hooks": ["comment-checker"],
 }
 ```
+
+### Structured Trace
+
+FM-Agent always writes structured execution traces under `fm_agent/trace/`:
+
+| Path | Content |
+|---|---|
+| `fm_agent/trace/events.jsonl` | Structured events for OpenCode calls and verification LLM calls |
+| `fm_agent/trace/payloads/` | Event payloads such as OpenCode stdout and selected LLM messages |
+| `fm_agent/trace/opencode/` | Optional raw OpenCode LLM request/response JSONL files |
+
+To capture raw OpenCode LLM traffic, install the OpenCode trace plugin manually by adding it to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@lucentia/opencode-trace"]
+}
+```
+
+FM-Agent automatically passes `TRACE_DIR` and `TRACE_FILENAME` to each OpenCode process. The plugin writes `fm_agent/trace/opencode/<event_id>.jsonl`, where `<event_id>` matches the corresponding `opencode_call` event in `events.jsonl`.
+OpenCode may cache the `@latest` package; to force a refresh, remove `~/.cache/opencode/packages/@lucentia/opencode-trace@latest`.
 
 
 ## Quick Start
@@ -128,10 +151,6 @@ Each confirmed or investigated bug produces a Markdown report containing:
 | Probe Output | Raw stdout from executing the probe script |
 
 A `summary.json` file in `fm_agent/bug_validation/` aggregates all bug results with counts of total reported, confirmed, not confirmed bugs.
-
-#### Log File (`fm_agent/fm_agent.log`)
-
-A single log file records the entire pipeline execution, including file extraction progress, reasoning submissions and completions, network errors and retries, and the final reasoning summary statistics. The log level is `INFO` and the format is `%(asctime)s [%(levelname)s] %(message)s`.
 
 ## Important Notes
 

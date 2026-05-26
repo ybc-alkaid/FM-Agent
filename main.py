@@ -1,8 +1,20 @@
-from config import OPENCODE_MAX_RETRIES, OPENCODE_SETUP_MODEL, OPENCODE_SPEC_MODEL
+from config import (
+    OPENCODE_MAX_RETRIES,
+    OPENCODE_SETUP_MODEL,
+    OPENCODE_SPEC_MODEL,
+    OPENCODE_MODEL_PROVIDER,
+    LLM_MODEL,
+)
 from src.file_utils import collect_file_names, is_file_ready
 from src.verification import streaming_reasoner
 from src.extract import run_extraction, EXT_TO_LANG
 from src.generate_topdown_layers import generate_topdown_layers
+from src.opencode_trace import (
+    finish_opencode_trace,
+    function_id_from_extracted_path,
+    run_opencode_traced,
+    start_opencode_traced,
+)
 import os
 import sys
 import json
@@ -54,37 +66,6 @@ def _deduplicate_phases(phases_dir):
     with open(phases_path, "w") as f:
         json.dump(data, f, indent=2)
 
-def _setup_logging(work_dir):
-    """Configure logging to write to a file in work_dir."""
-    log_path = os.path.join(work_dir, "fm_agent.log")
-    logging.basicConfig(
-        filename=log_path,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        force=True,
-    )
-
-
-def _detect_network_error(log_path):
-    """Scan the log file tail for network/provider errors. Return a short reason or None."""
-    try:
-        with open(log_path, "r", errors="replace") as f:
-            # Read only the last 8KB to avoid slow reads on large logs
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 8192))
-            tail = f.read()
-        if "provider_unavailable" in tail or "Network connection lost" in tail:
-            return "LLM provider returned 502 / network connection lost"
-        if "rate_limit" in tail.lower() or "429" in tail:
-            return "LLM provider rate-limited (429)"
-        if "timeout" in tail.lower():
-            return "request timeout"
-    except OSError:
-        pass
-    return None
-
-
 def _get_phase_files(phases_data, phase_num, input_dir):
     """Return relative paths of extracted function files for a given phase."""
     phase = next(p for p in phases_data["phases"] if p["phase"] == phase_num)
@@ -125,65 +106,6 @@ def _get_pending_batches(batches, proj_dir):
     return pending
 
 
-def _run_opencode_step(proj_dir, work_dir, script_dir, log_file,
-                       md_name, expected_file, stage_label, model):
-    """Run a single opencode session for a workflow step markdown file.
-
-    Copies the md file to work_dir, runs opencode against it, and retries
-    until expected_file exists or retries are exhausted.
-    """
-    md_src = os.path.join(script_dir, "md", md_name)
-    md_dst = os.path.join(work_dir, md_name)
-    shutil.copy2(md_src, md_dst)
-
-    fm_reminder = ("IMPORTANT: The fm_agent/ directory is NOT part of the project source code. "
-                    "It is a workspace for storing your output files only. "
-                    "Do NOT modify any existing project files.")
-    for attempt in range(1, OPENCODE_MAX_RETRIES + 1):
-        if attempt == 1:
-            prompt = f"Follow the instructions in the attached file. {fm_reminder}"
-        else:
-            prompt = ("Continue where you left off. The previous run was interrupted by a network error. "
-                      f"Check what has already been done and only complete the remaining steps. {fm_reminder}")
-        try:
-            subprocess.run(
-                ["opencode", "run", "--model", f"openrouter/{model}",
-                 "--file", os.path.join(proj_dir, "fm_agent", md_name), "--", prompt],
-                cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, check=True, stdout=log_file, stderr=log_file,
-            )
-        except subprocess.CalledProcessError as e:
-            logging.warning(f"{stage_label} attempt {attempt}: opencode exited with code {e.returncode}")
-
-        if os.path.exists(expected_file):
-            break
-
-        if attempt < OPENCODE_MAX_RETRIES:
-            log_file.flush()
-            _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-            reason_msg = f" ({_reason})" if _reason else ""
-            delay = 10
-            print(
-                f"[Pipeline] {stage_label} failed to produce {os.path.basename(expected_file)} "
-                f"(attempt {attempt}/{OPENCODE_MAX_RETRIES}){reason_msg}. Retrying in {delay}s..."
-            )
-            logging.warning(
-                f"{stage_label} attempt {attempt} failed: {os.path.basename(expected_file)} missing{reason_msg}. "
-                f"Retrying in {delay}s."
-            )
-            time.sleep(delay)
-        else:
-            log_file.flush()
-            _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-            reason_msg = f" Likely cause: {_reason}." if _reason else ""
-            print(
-                f"[Pipeline] ERROR: {stage_label} failed after {OPENCODE_MAX_RETRIES} attempts. "
-                f"{os.path.basename(expected_file)} is missing.{reason_msg} "
-                f"Check {os.path.basename(proj_dir)}/fm_agent/fm_agent.log for details."
-            )
-            log_file.close()
-            sys.exit(1)
-
-
 def _has_source_code(proj_dir):
     """Check whether proj_dir contains at least one source code file."""
     source_exts = set(EXT_TO_LANG.keys())
@@ -216,16 +138,21 @@ def run_pipeline(proj_dir):
     _clean_previous_run(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
-    _setup_logging(work_dir)
-    log_file = open(os.path.join(work_dir, "fm_agent.log"), "a")
-
     # Initialize opencode in the project directory (skip if AGENTS.md already exists)
     agent_md = os.path.join(proj_dir, "AGENTS.md")
     if os.path.exists(agent_md):
         print("[Pipeline] Stage 1/5: AGENTS.md found, skipping opencode init.")
     else:
         print("[Pipeline] Stage 1/5: Initializing opencode...")
-        subprocess.run(["opencode", "run", "--command", "init"], cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, check=True, stdout=log_file, stderr=log_file)
+        command = ["opencode", "run", "--model", f"{OPENCODE_MODEL_PROVIDER}/{LLM_MODEL}", "--command", "init"]
+        run_opencode_traced(
+            proj_dir=proj_dir,
+            work_dir=work_dir,
+            command=command,
+            stage="init",
+            output_files=["AGENTS.md"],
+            summary="Initialized OpenCode project context",
+        )
 
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it
     print("[Pipeline] Stage 2/5: Understanding codebase and extracting functions ...")
@@ -256,8 +183,22 @@ def run_pipeline(proj_dir):
         else:
             prompt = ("Continue where you left off. The previous run was interrupted by a network error. "
                       f"Check what has already been done and only complete the remaining steps. {fm_reminder}")
+        command = ["opencode", "run", "--model", f"{OPENCODE_MODEL_PROVIDER}/{OPENCODE_SETUP_MODEL}",
+                   "--file", os.path.join(proj_dir, "fm_agent", "workflow_setup_extract.md"), "--", prompt]
         try:
-            subprocess.run(["opencode", "run", "--model", f"openrouter/{OPENCODE_SETUP_MODEL}", "--file", os.path.join(proj_dir, "fm_agent", "workflow_setup_extract.md"), "--", prompt], cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, check=True, stdout=log_file, stderr=log_file)
+            run_opencode_traced(
+                proj_dir=proj_dir,
+                work_dir=work_dir,
+                command=command,
+                stage="setup_context",
+                input_files=["fm_agent/workflow_setup_extract.md"],
+                output_files=[
+                    "fm_agent/phases.json",
+                    "fm_agent/spec_prompts/domain_context/engine_overview.txt",
+                ],
+                summary=f"OpenCode setup context attempt {attempt}",
+                metadata={"attempt": attempt},
+            )
         except subprocess.CalledProcessError as e:
             logging.warning(f"Stage 2 attempt {attempt}: opencode exited with code {e.returncode}")
 
@@ -267,27 +208,19 @@ def run_pipeline(proj_dir):
             break
 
         if attempt < OPENCODE_MAX_RETRIES:
-            # Check log for network errors to provide better diagnostics
-            log_file.flush()
-            _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-            reason_msg = f" ({_reason})" if _reason else ""
             delay = 10
             print(
-                f"[Pipeline] Stage 2 failed to produce phases.json (attempt {attempt}/{OPENCODE_MAX_RETRIES}){reason_msg}. "
+                f"[Pipeline] Stage 2 failed to produce phases.json (attempt {attempt}/{OPENCODE_MAX_RETRIES}). "
                 f"Retrying in {delay}s..."
             )
-            logging.warning(f"Stage 2 attempt {attempt} failed: phases.json missing{reason_msg}. Retrying in {delay}s.")
+            logging.warning(f"Stage 2 attempt {attempt} failed: phases.json missing. Retrying in {delay}s.")
             time.sleep(delay)
         else:
-            log_file.flush()
-            _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-            reason_msg = f" Likely cause: {_reason}." if _reason else ""
             print(
                 f"[Pipeline] ERROR: Stage 2 failed after {OPENCODE_MAX_RETRIES} attempts. "
-                f"phases.json is missing.{reason_msg} "
-                f"Check {os.path.basename(proj_dir)}/fm_agent/fm_agent.log for details."
+                f"phases.json is missing. "
+                f"Check {os.path.basename(proj_dir)}/fm_agent/trace/ for details."
             )
-            log_file.close()
             sys.exit(1)
 
     # Deduplicate source files across phases
@@ -318,7 +251,6 @@ def run_pipeline(proj_dir):
 
     if not file_list:
         print("[Pipeline] No functions found to verify. Skipping spec generation.")
-        log_file.close()
         return
 
     # --- Stage 4: Generate topdown layers ---
@@ -367,7 +299,7 @@ def run_pipeline(proj_dir):
             subprocess.run(
                 ["python3", "fm_agent/spec_prompts/generate_batch_prompts.py",
                  "--phase", str(phase_num), "--layers", str(layer_idx)],
-                cwd=proj_dir, check=True, stdout=log_file, stderr=log_file,
+                cwd=proj_dir, check=True,
             )
 
             # Read manifest
@@ -399,9 +331,16 @@ def run_pipeline(proj_dir):
 
                 # Spawn concurrent opencode processes (one per pending batch)
                 spec_procs = []
+                spec_trace_records = []
                 for batch_info in pending_batches:
                     batch_file = batch_info["file"]
                     batch_prompt_rel = os.path.join(batch_rel_dir, batch_file)
+                    batch_prompt_abs = os.path.join(proj_dir, batch_prompt_rel)
+                    function_files = batch_info.get("functions", [])
+                    function_ids = [
+                        function_id_from_extracted_path(func_rel)
+                        for func_rel in function_files
+                    ]
                     fm_reminder = ("IMPORTANT: fm_agent/ is your output workspace, not project source. "
                                     "Do NOT modify any existing project files.")
                     if attempt == 1:
@@ -419,13 +358,31 @@ def run_pipeline(proj_dir):
                             f"that don't have [SPEC] blocks yet. "
                             f"Read fm_agent/spec_prompts/system_prompt.md for the format rules. {fm_reminder}"
                         )
-                    proc = subprocess.Popen(
-                        ["opencode", "run", "--model", f"openrouter/{OPENCODE_SPEC_MODEL}",
-                         "--file", os.path.join(proj_dir, "fm_agent", "workflow_spec_step4_batch.md"),
-                         "--", prompt],
-                        cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, stdout=log_file, stderr=log_file,
+                    command = ["opencode", "run", "--model", f"{OPENCODE_MODEL_PROVIDER}/{OPENCODE_SPEC_MODEL}",
+                               "--file", os.path.join(proj_dir, "fm_agent", "workflow_spec_step4_batch.md"),
+                               "--", prompt]
+                    trace_record = start_opencode_traced(
+                        proj_dir=proj_dir,
+                        work_dir=work_dir,
+                        command=command,
+                        stage="spec_generation",
+                        function_ids=function_ids,
+                        input_files=[
+                            "fm_agent/workflow_spec_step4_batch.md",
+                            batch_prompt_rel,
+                            "fm_agent/spec_prompts/system_prompt.md",
+                        ],
+                        output_files=function_files,
+                        summary=f"OpenCode spec generation for {batch_file}",
+                        metadata={
+                            "attempt": attempt,
+                            "phase": phase_num,
+                            "layer": layer_idx,
+                            "batch_file": batch_file,
+                        },
                     )
-                    spec_procs.append(proc)
+                    spec_trace_records.append(trace_record)
+                    spec_procs.append(trace_record.proc)
 
                 logging.info(
                     f"Phase {phase_num} Layer {layer_idx} attempt {attempt}: "
@@ -440,6 +397,8 @@ def run_pipeline(proj_dir):
 
                 for proc in spec_procs:
                     proc.wait()
+                for trace_record in spec_trace_records:
+                    finish_opencode_trace(trace_record)
 
                 # Check if any files in this layer received specs
                 specs_generated = sum(
@@ -458,38 +417,29 @@ def run_pipeline(proj_dir):
                     continue
 
                 if attempt < OPENCODE_MAX_RETRIES:
-                    log_file.flush()
-                    _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-                    reason_msg = f" ({_reason})" if _reason else ""
                     delay = 10
                     print(
                         f"[Pipeline] Stage 5 Phase {phase_num} Layer {layer_idx} produced no specs "
-                        f"(attempt {attempt}/{OPENCODE_MAX_RETRIES}){reason_msg}. "
+                        f"(attempt {attempt}/{OPENCODE_MAX_RETRIES}). "
                         f"Retrying in {delay}s..."
                     )
                     logging.warning(
                         f"Stage 5 Phase {phase_num} Layer {layer_idx} attempt {attempt} failed: "
-                        f"no specs generated{reason_msg}. Retrying in {delay}s."
+                        f"no specs generated. Retrying in {delay}s."
                     )
                     time.sleep(delay)
                 else:
-                    log_file.flush()
-                    _reason = _detect_network_error(os.path.join(work_dir, "fm_agent.log"))
-                    reason_msg = f" Likely cause: {_reason}." if _reason else ""
                     print(
                         f"[Pipeline] ERROR: Stage 5 Phase {phase_num} Layer {layer_idx} failed "
                         f"after {OPENCODE_MAX_RETRIES} attempts. "
-                        f"No specs were generated.{reason_msg} "
-                        f"Check {os.path.basename(proj_dir)}/fm_agent/fm_agent.log for details."
+                        f"No specs were generated. "
+                        f"Check {os.path.basename(proj_dir)}/fm_agent/trace/ for details."
                     )
-                    log_file.close()
                     sys.exit(1)
 
         # Mark all files from this phase as processed for subsequent phases
         for rel in phase_files:
             all_processed.add(os.path.join(input_dir, rel))
-
-    log_file.close()
 
     # Print confirmed bug count
     summary_path = os.path.join(work_dir, "bug_validation", "summary.json")
