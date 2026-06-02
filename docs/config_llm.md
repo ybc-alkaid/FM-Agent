@@ -3,7 +3,7 @@
 FM-Agent reads these settings from `.env` (mapped to constants in `config.py`):
 
 ```dotenv
-OPENROUTER_API_KEY=your-api-key                  # auth token for FM-Agent's direct calls
+LLM_API_KEY=your-api-key                  # auth token for FM-Agent's direct calls
 LLM_API_BASE_URL=https://openrouter.ai/api/v1    # endpoint for FM-Agent's direct reasoner calls
 LLM_MODEL=anthropic/claude-sonnet-4.6            # a model key registered under the provider below
 OPENCODE_MODEL_PROVIDER=openrouter               # an OpenCode provider id
@@ -12,7 +12,7 @@ OPENCODE_MODEL_PROVIDER=openrouter               # an OpenCode provider id
 It calls the model two ways:
 
 - **OpenCode** (setup / spec / bug validation): `opencode run --model "$OPENCODE_MODEL_PROVIDER/$LLM_MODEL"`, so that string must resolve to a provider + model registered in OpenCode (below).
-- **Direct** (reasoner): hits `$LLM_API_BASE_URL` itself, authenticating with `$OPENROUTER_API_KEY`.
+- **Direct** (reasoner): hits `$LLM_API_BASE_URL` itself, authenticating with `$LLM_API_KEY`.
 
 ## Register the OpenCode provider
 
@@ -26,7 +26,7 @@ It calls the model two ways:
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "https://openrouter.ai/api/v1",
-        "apiKey": "{env:OPENROUTER_API_KEY}"
+        "apiKey": "{env:LLM_API_KEY}"
       },
       "models": { "anthropic/claude-sonnet-4.6": {} }
     }
@@ -40,7 +40,7 @@ How it lines up with `.env`:
 |---|---|
 | provider key (`openrouter`) | `OPENCODE_MODEL_PROVIDER` |
 | `options.baseURL` | `LLM_API_BASE_URL` |
-| `options.apiKey` | `OPENROUTER_API_KEY` (read from env, never hard-coded) |
+| `options.apiKey` | `LLM_API_KEY` (read from env, never hard-coded) |
 | a key under `models` | `LLM_MODEL` |
 
 To use another endpoint, copy the block, rename it, point `baseURL` at the endpoint, and update `.env` to match. Pick `npm` by API style: `@ai-sdk/openai-compatible` (OpenAI-style: OpenRouter, svip) or `@ai-sdk/anthropic` (Anthropic-style, native `/v1/messages`).
@@ -58,7 +58,7 @@ The [`opencode-svip-proxy`](https://www.npmjs.com/package/opencode-svip-proxy) O
   "provider": {
     "svip": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "https://svip.xty.app/v1", "apiKey": "{env:OPENROUTER_API_KEY}" },
+      "options": { "baseURL": "https://svip.xty.app/v1", "apiKey": "{env:LLM_API_KEY}" },
       "models": { "claude-sonnet-4-6": {}, "claude-opus-4-7": {} }
     }
   }
