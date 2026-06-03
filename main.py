@@ -120,7 +120,7 @@ def _has_source_code(proj_dir):
     return False
 
 
-def run_pipeline(proj_dir):
+def run_pipeline(proj_dir, resume=False):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
@@ -134,8 +134,17 @@ def run_pipeline(proj_dir):
     input_dir = os.path.join(work_dir, "extracted_functions")
     output_dir = os.path.join(work_dir, "logic_verification_results")
 
-    # Clean files from the previous run
-    _clean_previous_run(work_dir)
+    # Clean files from the previous run — unless resuming, where we keep all
+    # prior progress (phases.json, generated specs, verification results) and
+    # only do the remaining work.
+    if resume:
+        if os.path.isdir(work_dir):
+            print(f"[Pipeline] RESUME: keeping existing {os.path.relpath(work_dir, proj_dir)}/ — only remaining work will run.")
+        else:
+            print("[Pipeline] RESUME requested but no previous fm_agent/ found — starting fresh.")
+            resume = False
+    else:
+        _clean_previous_run(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
     # Initialize opencode in the project directory (skip if AGENTS.md already exists)
@@ -157,6 +166,11 @@ def run_pipeline(proj_dir):
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it
     print("[Pipeline] Stage 2/5: Understanding codebase and extracting functions ...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    # On resume, reuse the existing phase plan instead of paying for the
+    # (non-deterministic) setup_context LLM call again.
+    _resume_skip_setup = resume and os.path.exists(os.path.join(work_dir, "phases.json"))
+    if _resume_skip_setup:
+        print("[Pipeline] Stage 2/5: RESUME — phases.json found, skipping setup_context (reusing phase plan).")
     workflow_src = os.path.join(script_dir, "md", "workflow_setup_extract.md")
     workflow_dst = os.path.join(work_dir, "workflow_setup_extract.md")
     shutil.copy2(workflow_src, workflow_dst)
@@ -178,6 +192,8 @@ def run_pipeline(proj_dir):
                     "Do NOT include fm_agent/ paths in phases.json. "
                     "Do NOT modify any existing project files.")
     for attempt in range(1, OPENCODE_MAX_RETRIES + 1):
+        if _resume_skip_setup:
+            break
         if attempt == 1:
             prompt = f"Follow the instructions in the attached file. {fm_reminder}"
         else:
@@ -227,8 +243,10 @@ def run_pipeline(proj_dir):
     _deduplicate_phases(work_dir)
 
     # Run function extraction using extract.py
+    # force=False on resume preserves already-specced extracted files; on a fresh
+    # run fm_agent/ was just wiped so it is equivalent to force=True.
     print("[Pipeline] Extracting functions from source files...")
-    run_extraction(proj_dir, work_dir=work_dir, force=True, verbose=True)
+    run_extraction(proj_dir, work_dir=work_dir, force=not resume, verbose=True)
 
     # Copy system_prompt.md to spec_prompts/system_prompt.md
     spec_prompts_dir = os.path.join(work_dir, "spec_prompts")
@@ -453,11 +471,17 @@ def run_pipeline(proj_dir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 main.py <proj_dir>")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+    if not args:
+        print("Usage: python3 main.py <proj_dir> [--resume]")
+        print("  --resume   continue a previous run in <proj_dir>/fm_agent instead of")
+        print("             wiping it: keeps phases.json, generated specs, and existing")
+        print("             verification results; only does the remaining work.")
         sys.exit(1)
 
+    resume = "--resume" in flags or os.environ.get("FM_AGENT_RESUME") == "1"
     start_time = time.time()
-    run_pipeline(os.path.abspath(sys.argv[1]))
+    run_pipeline(os.path.abspath(args[0]), resume=resume)
     end_time = time.time()
     logging.info(f"Total time: {end_time - start_time:.2f} seconds")

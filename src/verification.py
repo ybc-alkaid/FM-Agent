@@ -343,6 +343,15 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None):
                "--", "Follow the instructions in the attached file"]
     result_relpath = os.path.join("fm_agent", "bug_validation", f"{bug_id}.result.json")
     result_path = os.path.join(proj_dir, result_relpath)
+    # Resume idempotency: if this bug was already validated, don't pay for it again.
+    if os.path.exists(result_path):
+        try:
+            with open(result_path) as _f:
+                json.load(_f)
+            logging.info(f"Bug validation already done, skipping: {bug_id}")
+            return
+        except (json.JSONDecodeError, OSError):
+            pass  # corrupted result — re-validate
     try:
         max_attempts = BUG_VALIDATION_MAX_RETRIES + 1
         for attempt in range(1, max_attempts + 1):
