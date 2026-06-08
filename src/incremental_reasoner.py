@@ -1,10 +1,13 @@
 import os
+import glob
 import json
 import time
+import shutil
 import logging
 import subprocess
 import tempfile
 import concurrent.futures
+from datetime import datetime
 from pathlib import Path
 
 from config import (
@@ -37,6 +40,37 @@ from .generate_batch_prompts import (
 from .opencode_trace import run_opencode_traced
 from .scope import _parse_issue_signals, rank_functions_in_file
 from .verification import _verify_single_file, _validate_single_bug, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
+
+
+def _setup_incremental_logging(work_dir):
+    """
+    Route the incremental pipeline's progress output to a log file (and nothing else).
+
+    Configures the root logger with a single FileHandler at
+    work_dir/incremental_<YYYYmmdd_HHMMSS>.log (the timestamp is taken when this is called,
+    so each pipeline run writes its own log file rather than overwriting the previous one) so
+    every logging.* call in this module — the stage-by-stage progress that used to be
+    print()ed, plus the existing warning/error/exception records — is written to that file
+    instead of the console. Any handlers a previous call (or import) installed are replaced,
+    so invoking the pipeline repeatedly in one process does not duplicate log lines or leak
+    output to stdout. Returns the absolute path of the log file.
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(work_dir, f"incremental_{timestamp}.log")
+
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # File only — replace existing handlers so nothing is emitted to the console.
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    return log_path
 
 
 def check_last_run_existence(proj_dir):
@@ -455,43 +489,76 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     input_dir = os.path.join(work_dir, "extracted_functions")
     output_dir = os.path.join(work_dir, "logic_verification_results")
 
-    print("=" * 70)
-    print("INCREMENTAL PIPELINE START")
-    print(f"  project dir : {proj_dir}")
-    print(f"  intent file : {intent_file_path}")
-    print(f"  base commit : {old_commit_id}")
-    print("=" * 70)
+    _setup_incremental_logging(work_dir)
+
+    logging.info("=" * 70)
+    logging.info("INCREMENTAL PIPELINE START")
+    logging.info("  project dir : %s", proj_dir)
+    logging.info("  intent file : %s", intent_file_path)
+    logging.info("  base commit : %s", old_commit_id)
+    logging.info("=" * 70)
 
     # 1. Check whether there is a last run to compare against; if not, fall back to a full run since we have no basis for incremental analysis.
-    print("[Stage 1/10] Checking for a previous full run to compare against...")
+    logging.info("[Stage 1/10] Checking for a previous full run to compare against...")
     has_last_run = check_last_run_existence(proj_dir)
     if not has_last_run:
-        print(
+        logging.warning(
             "No previous full run detected (phases.json missing or incomplete extracted_functions), so falling back to a full run rather than incremental."
         )
         run_pipeline(proj_dir)
         return
-    print("  -> previous full run found; proceeding with incremental analysis.")
+    logging.info("  -> previous full run found; proceeding with incremental analysis.")
 
     # 2. Check whether the intent file is valid; if not, fail since we don't know what to analyze incrementally.
-    print("[Stage 2/10] Loading developer intent...")
+    logging.info("[Stage 2/10] Loading developer intent...")
     developer_intent = ""
     if not os.path.isfile(intent_file_path):
-        print(f"Intent file {intent_file_path} does not exist; cannot run incremental pipeline.")
+        logging.error("Intent file %s does not exist; cannot run incremental pipeline.", intent_file_path)
         return
     else:
         with open(intent_file_path, "r") as f:
             developer_intent = f.read().strip()
         if not developer_intent:
-            print(f"Intent file {intent_file_path} is empty; cannot run incremental pipeline.")
+            logging.error("Intent file %s is empty; cannot run incremental pipeline.", intent_file_path)
             return
-    print(f"  -> intent loaded ({len(developer_intent)} chars).")
+    logging.info("  -> intent loaded (%d chars).", len(developer_intent))
+
+    # Wipe the previous run's verification artifacts. The prior full run wrote a verdict for
+    # EVERY function into logic_verification_results/ and every confirmed bug into
+    # bug_validation/, but this incremental run only re-verifies the changed/affected subset.
+    # If left in place, those folders would mix stale full-run results with this run's fresh
+    # ones, making it ambiguous which verdicts are the latest. Clear them so the folders hold
+    # only this incremental run's output.
+    for stale_dir in (output_dir, os.path.join(work_dir, "bug_validation")):
+        if os.path.isdir(stale_dir):
+            shutil.rmtree(stale_dir, ignore_errors=True)
+            logging.info("  -> removed stale results dir %s.", stale_dir)
+
+    # Also remove the scope-selection and spec-update prompt/result artifacts a prior
+    # incremental run left directly in fm_agent/ (module/file relevance selection and
+    # per-function spec updates). They are keyed by a per-run index, so leftovers from an
+    # earlier run would sit alongside this run's and obscure which artifacts are current.
+    stale_artifact_globs = (
+        "select_relevant_modules.md", "relevant_modules.json",
+        "select_relevant_files_*.md", "relevant_files_*.json",
+        "spec_update_*.md", "spec_update_*.json",
+    )
+    removed_artifacts = 0
+    for pattern in stale_artifact_globs:
+        for stale_file in glob.glob(os.path.join(work_dir, pattern)):
+            try:
+                os.remove(stale_file)
+                removed_artifacts += 1
+            except OSError:
+                pass
+    if removed_artifacts:
+        logging.info("  -> removed %d stale scope-selection artifact(s) from %s.", removed_artifacts, work_dir)
 
     # 3. Re-generate the phases.json
-    print("[Stage 3/10] Generating new phases.json based on current working tree...")
+    logging.info("[Stage 3/10] Generating new phases.json based on current working tree...")
     phases_json_path = os.path.join(proj_dir, "fm_agent", "phases.json")
     _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=True)
-    print("  -> phases.json regenerated.")
+    logging.info("  -> phases.json regenerated.")
 
     # 4. Update functions under fm_agent/extracted_functions/.
     #    Capture the previous run's specs first (re-extraction overwrites each file with
@@ -499,70 +566,72 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     #    [SPEC]/[INFO] headers onto every function that still exists. Functions that were
     #    added or whose extraction path changed are left unspecced for the spec-update
     #    stage to handle; unchanged functions keep their previous specs verbatim.
-    print("[Stage 4/10] Re-extracting functions and restoring previous specs...")
+    logging.info("[Stage 4/10] Re-extracting functions and restoring previous specs...")
     old_spec = extract_existing_specs(proj_dir)
-    print(f"  -> captured {len(old_spec)} existing spec block(s) before re-extraction.")
+    logging.info("  -> captured %d existing spec block(s) before re-extraction.", len(old_spec))
     run_extraction(proj_dir, work_dir=work_dir, force=True, verbose=True)
     _reapply_existing_specs(proj_dir, old_spec)
-    print("  -> functions re-extracted and prior [SPEC]/[INFO] headers reapplied.")
+    logging.info("  -> functions re-extracted and prior [SPEC]/[INFO] headers reapplied.")
 
     # 5. Collect changed functions by comparing against the old version of functions in commit_id
-    print("[Stage 5/10] Collecting changed functions vs. base commit...")
+    logging.info("[Stage 5/10] Collecting changed functions vs. base commit...")
     changed_functions = _collect_changed_functions(proj_dir, old_commit_id)
     n_added = sum(len(c.get("added", [])) for c in changed_functions.values())
     n_removed = sum(len(c.get("removed", [])) for c in changed_functions.values())
     n_modified = sum(len(c.get("modified", [])) for c in changed_functions.values())
-    print(
-        f"  -> {len(changed_functions)} changed file(s): "
-        f"{n_added} added, {n_modified} modified, {n_removed} removed function(s)."
+    logging.info(
+        "  -> %d changed file(s): %d added, %d modified, %d removed function(s).",
+        len(changed_functions), n_added, n_modified, n_removed,
     )
 
     # 5b. Delete extracted-function files for functions (or whole source files) that were
     #     removed since old_commit_id. Re-extraction never rewrites these, so without this
     #     they linger as stale specs and would pollute the file list and call graph below.
     _remove_stale_extracted(proj_dir, changed_functions)
-    print("  -> stale extracted-function files for removed functions deleted.")
+    logging.info("  -> stale extracted-function files for removed functions deleted.")
 
     # 6. Update file list
-    print("[Stage 6/10] Collecting file list...")
+    logging.info("[Stage 6/10] Collecting file list...")
     file_list = collect_file_names(input_dir, os.path.join(work_dir, "fm_agent_file_list.json"))
-    print(f"  -> file list has {len(file_list)} entr(ies).")
+    logging.info("  -> file list has %d entr(ies).", len(file_list))
 
     # 7. Update top-down layers
-    print("[Stage 7/10] Generating topdown layers...")
+    logging.info("[Stage 7/10] Generating topdown layers...")
     phases_data = json.load(open(os.path.join(work_dir, "phases.json")))
     generate_topdown_layers(work_dir)
-    print(f"  -> topdown layers generated for {len(phases_data.get('phases', []))} phase(s).")
+    logging.info("  -> topdown layers generated for %d phase(s).", len(phases_data.get("phases", [])))
 
     # 8. Collect the scope of functions relevant to the developer intent (the intent file defines the goal of modification).
-    print("[Stage 8/10] Collecting functions relevant to the developer intent...")
+    logging.info("[Stage 8/10] Collecting functions relevant to the developer intent...")
     spec_files = collect_relevent_function_scope(proj_dir, developer_intent, changed_functions)
-    print(f"  -> {len(spec_files)} function(s) judged relevant to the intent.")
+    logging.info("  -> %d function(s) judged relevant to the intent.", len(spec_files))
 
     # 9. Re-generate the spec of functions if it satisfies one of the following conditions: 1) the function is changed; 2) the function is relevant to the developer intent.
-    print("[Stage 9/10] Updating specs for changed and relevant functions...")
+    logging.info("[Stage 9/10] Updating specs for changed and relevant functions...")
     updated_spec_files = _update_specs_for_intent(
         proj_dir, work_dir, developer_intent, changed_functions, spec_files
     )
     record_path = os.path.join(work_dir, "incremental_updated_specs.json")
     with open(record_path, "w") as f:
         json.dump({"updated_specs": updated_spec_files}, f, indent=2)
-    print(
-        f"  -> {len(updated_spec_files)} spec(s) updated; "
-        f"record written to {record_path}."
+    logging.info(
+        "  -> %d spec(s) updated; record written to %s.",
+        len(updated_spec_files), record_path,
     )
 
     # 10. Run the verification stage only on the functions that satisfy one of the following conditions: 1) the function is changed; 2) the function spec is changed after step 9; 3) the callee spec of the function is changed.
-    print("[Stage 10/10] Verifying changed and affected functions...")
+    logging.info("[Stage 10/10] Verifying changed and affected functions...")
     buggy_files = _verify_incremental_functions(
         proj_dir, work_dir, changed_functions, updated_spec_files
     )
-    print("=" * 70)
-    print(f"INCREMENTAL PIPELINE DONE: bug validation confirmed bugs in "
-          f"{len(buggy_files)} function(s).")
+    logging.info("=" * 70)
+    logging.info(
+        "INCREMENTAL PIPELINE DONE: bug validation confirmed bugs in %d function(s).",
+        len(buggy_files),
+    )
     for bf in buggy_files:
-        print(f"  - {bf}")
-    print("=" * 70)
+        logging.info("  - %s", bf)
+    logging.info("=" * 70)
     return buggy_files
 
 
@@ -703,9 +772,9 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
             modules.append((phase_num, module))
 
     if not modules:
-        print("    [scope] no modules in phases.json; nothing to select.")
+        logging.info("    [scope] no modules in phases.json; nothing to select.")
         return []
-    print(f"    [scope] pass 1/3: selecting relevant modules from {len(modules)} module(s)...")
+    logging.info("    [scope] pass 1/3: selecting relevant modules from %d module(s)...", len(modules))
 
     # Pass 1: module selection. opencode reads fm_agent/phases.json itself (the agent's cwd
     # is proj_dir), reasons over the module descriptions, and writes the selected modules to
@@ -750,11 +819,16 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
         if (phase_num, module.get("name")) in selected_keys
     ]
     if not relevant_modules:
-        print("    [scope] pass 1/3: no relevant modules selected.")
+        logging.info("    [scope] pass 1/3: no relevant modules selected.")
         return []
-    print(
-        f"    [scope] pass 2/3: {len(relevant_modules)} relevant module(s); "
-        "selecting relevant files per module..."
+    for phase_num, module in relevant_modules:
+        logging.info(
+            "    [scope] pass 1/3: relevant module: phase %s / %s",
+            phase_num, module.get("name", "(unnamed)"),
+        )
+    logging.info(
+        "    [scope] pass 2/3: %d relevant module(s); selecting relevant files per module...",
+        len(relevant_modules),
     )
 
     # Pass 2: file selection. For each relevant module, opencode reads that module's source
@@ -805,13 +879,17 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
 
         if chosen:
             filtered_modules.append({**module, "source_files": chosen})
+            logging.info(
+                "    [scope] pass 2/3: module %s -> %d relevant file(s): %s",
+                module_name, len(chosen), ", ".join(chosen),
+            )
 
     if not filtered_modules:
-        print("    [scope] pass 2/3: no relevant files selected.")
+        logging.info("    [scope] pass 2/3: no relevant files selected.")
         return []
-    print(
-        f"    [scope] pass 3/3: ranking functions in {len(filtered_modules)} "
-        "module(s) by relevance..."
+    logging.info(
+        "    [scope] pass 3/3: ranking functions in %d module(s) by relevance...",
+        len(filtered_modules),
     )
 
     # Pass 3: function selection via the scope.py localization algorithm. For each chosen
@@ -857,6 +935,11 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
                     cand = os.path.join(func_dir, f"{f['name']}.{ext}")
                     if os.path.isfile(cand):
                         _record(os.path.relpath(cand, extracted_dir), f.get("score", 0.0))
+                logging.info(
+                    "    [scope] pass 3/3: %s -> %s",
+                    src_rel,
+                    ", ".join(f"{f['name']}={f.get('score', 0.0):.2f}" for f in ranked),
+                )
             else:
                 # scope.py could not localize within this file — keep all of its functions.
                 for fname in os.listdir(func_dir):
@@ -869,6 +952,8 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
     ordered = sorted(scored, key=lambda p: (-scored[p], p))
     if range is not None:
         ordered = ordered[:range]
+    for rel_path in ordered:
+        logging.info("    [scope] selected function: %s (score %.2f)", rel_path, scored[rel_path])
     return ordered
 
 
@@ -929,13 +1014,22 @@ def _opencode_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_
     prompt_relpath = os.path.join("fm_agent", f"spec_update_{idx}.md")
 
     callee_hint = ", ".join(sorted(callee_names)) if callee_names else "(none)"
-    if info_block is not None:
+    if not callee_names:
+        info_section = "This function has no callees, so there is no [INFO] block to maintain.\n\n"
+    elif info_block is not None:
         info_section = (
             "## Current [INFO] block (the expected specs of the callees this function depends on)\n\n"
             f"{info_block}\n\n"
+            "NOTE: a modification may have changed which callees this function calls, so this "
+            f"block may be missing entries for some current callees ({callee_hint}) or contain "
+            "entries for callees no longer called.\n\n"
         )
     else:
-        info_section = "This function has no [INFO] block, so skip the [INFO] step.\n\n"
+        info_section = (
+            "This function currently has no [INFO] block, but a modification may have made it "
+            f"call other functions, so it now has callees ({callee_hint}); a new [INFO] block "
+            "may need to be created for them.\n\n"
+        )
 
     prompt_content = (
         "# Update Function Specification\n\n"
@@ -959,17 +1053,22 @@ def _opencode_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_
         "2. If it must change, produce the COMPLETE replacement [SPEC] block — the "
         "`[SPEC]` ... `[SPEC]` block only, markers included, every line prefixed with "
         f"`{comment_prefix}`, and NO source code.\n"
-        "3. ONLY if you updated the [SPEC] block AND this function has an [INFO] block: "
-        "decide whether the expected spec of any callee recorded in the [INFO] block must "
-        "change as a consequence. If so, produce the COMPLETE replacement [INFO] block (the "
-        f"`[INFO]` ... `[INFO]` block only, markers included, lines prefixed with `{comment_prefix}`) "
-        "and list the names of the callees whose expected spec you changed.\n"
+        "3. ONLY if you updated the [SPEC] block AND this function has callees: bring the "
+        f"[INFO] block into line with this function's CURRENT callees ({callee_hint}). That "
+        "means: (a) keep entries whose recorded expectation still matches the callee's role, "
+        "(b) ADD an entry for any current callee not yet recorded (e.g. one the modification "
+        "introduced), (c) DROP entries for callees this function no longer calls, and (d) "
+        "revise any entry whose expected spec must change as a consequence of the new [SPEC]. "
+        "If any of (a)-(d) changes the block, produce the COMPLETE replacement [INFO] block "
+        f"(the `[INFO]` ... `[INFO]` block only, markers included, lines prefixed with "
+        f"`{comment_prefix}`) and list the names of the callees whose expected spec you added "
+        "or changed.\n"
         f"4. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
         '   - "spec_updated": boolean.\n'
         '   - "new_spec": string — the full replacement [SPEC] block, or "" if not updated.\n'
-        '   - "info_updated": boolean.\n'
+        '   - "info_updated": boolean — true when you produced a new/replacement [INFO] block.\n'
         '   - "new_info": string — the full replacement [INFO] block, or "" if not updated.\n'
-        '   - "updated_callees": array of callee name strings whose expected spec changed, or [].\n'
+        '   - "updated_callees": array of callee name strings whose expected spec you added or changed, or [].\n'
         "   Write ONLY that JSON file; do not modify any other project files.\n"
     )
 
@@ -1198,11 +1297,11 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
         seed.add(_file_to_fqn(os.path.join(extracted_dir, rel), work_dir))
 
     if not seed:
-        print("    [specs] no changed or relevant functions to update; skipping.")
+        logging.info("    [specs] no changed or relevant functions to update; skipping.")
         return []
-    print(
-        f"    [specs] seeded {len(seed)} function(s) for spec re-generation "
-        f"({len(changed_targets)} changed, {len(relevant_rel_files)} relevant)."
+    logging.info(
+        "    [specs] seeded %d function(s) for spec re-generation (%d changed, %d relevant).",
+        len(seed), len(changed_targets), len(relevant_rel_files),
     )
 
     # Top-down order (callers before the callees they depend on); FQNs absent from the layer
@@ -1270,16 +1369,17 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
             info_block = new_info or None
             info_updated = bool(new_info)
         else:
-            # Keep the existing [INFO] block unless opencode rewrote it (only meaningful when
-            # the function actually has one).
+            # Keep the existing [INFO] block unless opencode rewrote it. A modified function may
+            # now call a different set of callees, so a fresh [INFO] block can legitimately be
+            # created even when the function previously had none (old_info is None) — gate on
+            # whether opencode produced a block, not on a prior block existing.
             info_block = old_info
-            info_updated = bool(result.get("info_updated")) and old_info is not None
-            if info_updated:
+            info_updated = False
+            if result.get("info_updated"):
                 new_info = (result.get("new_info") or "").strip()
                 if new_info:
                     info_block = new_info
-                else:
-                    info_updated = False
+                    info_updated = True
 
         # Splice the new block(s) back in, leaving the function source unchanged (mirrors the
         # full run's specced-file layout: [SPEC], blank line, optional [INFO], blank line, source).
@@ -1370,9 +1470,9 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
             batch = [pending[0]]
         checked.update(batch)
         round_num += 1
-        print(
-            f"    [specs] round {round_num}: checking {len(batch)} function(s) "
-            f"({len(pending)} pending, {len(checked)} checked so far)..."
+        logging.info(
+            "    [specs] round %d: checking %d function(s) (%d pending, %d checked so far)...",
+            round_num, len(batch), len(pending), len(checked),
         )
 
         # Stage 1 (concurrent): decide each function's new spec — LLM-bound, no file writes.
@@ -1406,9 +1506,9 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
                     if callee_fqn not in checked:
                         to_check.add(callee_fqn)
                         queued_callees += 1
-        print(
-            f"    [specs] round {round_num}: {len(applied)} spec(s) rewritten, "
-            f"{queued_callees} callee(s) queued for propagation."
+        logging.info(
+            "    [specs] round %d: %d spec(s) rewritten, %d callee(s) queued for propagation.",
+            round_num, len(applied), queued_callees,
         )
 
         # Stage 3 (concurrent): upward reconciliation. Each function whose [SPEC] changed needs
@@ -1500,9 +1600,9 @@ def _verify_incremental_functions(proj_dir, work_dir, changed_functions, updated
         if os.path.exists(path)
     })
     if not file_list:
-        print("    [verify] no functions require re-verification.")
+        logging.info("    [verify] no functions require re-verification.")
         return []
-    print(f"    [verify] running reasoner on {len(file_list)} function(s)...")
+    logging.info("    [verify] running reasoner on %d function(s)...", len(file_list))
 
     # Drop stale verification results so the reasoner re-runs rather than reusing the cached
     # verdict from the previous full run.
@@ -1534,14 +1634,14 @@ def _verify_incremental_functions(proj_dir, work_dir, changed_functions, updated
             if verdict == "MISMATCH":
                 mismatches.append(rel)
 
-    print(f"    [verify] reasoner reported {len(mismatches)} MISMATCH(es) (candidate bugs).")
+    logging.info("    [verify] reasoner reported %d MISMATCH(es) (candidate bugs).", len(mismatches))
     if not mismatches:
         return []
 
     # Bug validation: the reasoner's MISMATCH is only a candidate bug, so validate each one
     # with opencode (_validate_single_bug writes work_dir/bug_validation/<bug_id>.result.json
     # with a confirmation_status). Run them concurrently, bounded by MAX_WORKERS.
-    print(f"    [verify] validating {len(mismatches)} candidate bug(s) with opencode...")
+    logging.info("    [verify] validating %d candidate bug(s) with opencode...", len(mismatches))
 
     def _validate(rel):
         result_json_rel = os.path.join(

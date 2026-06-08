@@ -53,6 +53,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from config import (
+    SCOPE_LLM_CONFIDENCE_THRESHOLD,
+    SCOPE_LLM_TOP_K,
+    SCOPE_LLM_TRIGGER_FUNCS,
+    SCOPE_TOP_K,
+)
+
 from .extract import (
     EXT_TO_LANG,
     LANG_CONFIG,
@@ -63,10 +70,10 @@ from .extract import (
 logger = logging.getLogger(__name__)
 
 # ── tuneable constants ──────────────────────────────────────────────────────
-TOP_K = 10               # functions to keep per file in the final output
-LLM_TRIGGER_FUNCS = 40  # file has ≥ this many (deduped) functions → try LLM
-LLM_TOP_K = 8           # how many functions to ask the LLM to pick
-LLM_CONFIDENCE_THRESHOLD = 8.0  # top heuristic score below this → try LLM
+TOP_K = SCOPE_TOP_K               # functions to keep per file in the final output
+LLM_TRIGGER_FUNCS = SCOPE_LLM_TRIGGER_FUNCS  # file has ≥ this many (deduped) functions → try LLM
+LLM_TOP_K = SCOPE_LLM_TOP_K           # how many functions to ask the LLM to pick
+LLM_CONFIDENCE_THRESHOLD = SCOPE_LLM_CONFIDENCE_THRESHOLD  # top heuristic score below this → try LLM
 
 # Signal weights
 W_TRACEBACK        = 10.0
@@ -780,6 +787,7 @@ def rank_functions_in_file(
     """
     funcs_info, source_lines, classes = _parse_file(src_path)
     if funcs_info is None or not funcs_info:
+        print(f"  [scope] {filepath}: no functions found, skipping")
         return []
 
     # Git history signal: precise per-function recency via git log -L
@@ -802,6 +810,23 @@ def rank_functions_in_file(
 
     # Proximity boost (after dedup, so anchors are the right unique functions)
     deduped_ranked = _apply_proximity_boost(deduped_ranked)
+
+    # ── print per-file function scores ──────────────────────────────────────
+    print(f"\n{'─' * 70}")
+    print(f"FILE: {filepath}  ({len(deduped_ranked)} unique functions)")
+    if classes:
+        class_names = [c['name'] for c in classes]
+        print(f"  classes found: {class_names}")
+    if git_scores:
+        git_funcs = [
+            f['name'] for f in funcs_info if f['start'] in git_scores
+        ]
+        print(f"  git-recently-changed functions: {git_funcs}")
+    print(f"  {'rank':>4}  {'score':>8}  {'name'}")
+    print(f"  {'----':>4}  {'-------':>8}  {'----'}")
+    for rank, f in enumerate(deduped_ranked, 1):
+        marker = "  <<" if rank <= top_k else ""
+        print(f"  {rank:>4}  {f['score']:>8.3f}  {f['name']}  (L{f['start']}-{f['end']}){marker}")
 
     candidates = deduped_ranked[:top_k]
     reason = 'heuristic'
@@ -851,6 +876,9 @@ def rank_functions_in_file(
             'score':       round(f.get('score', 0.0), 3),
             'reason':      f.get('reason', reason),
         })
+
+    print(f"  → selected ({reason}): " +
+          ", ".join(f"{r['name']} ({r['score']:.3f})" for r in result))
     return result
 
 
@@ -894,6 +922,16 @@ def run_scope_functions(
 
     signals = _parse_issue_signals(issue)
 
+    # ── print extracted issue signals ──────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("SCOPE: Extracted issue signals")
+    print("=" * 70)
+    for tier, values in signals.items():
+        if values:
+            print(f"  {tier:20s}: {sorted(values)}")
+    print(f"\nSCOPE: Processing {len(scope_files)} scoped file(s): {scope_files}")
+    print("=" * 70)
+
     all_functions: list[dict] = []
     for filepath in scope_files:
         src_path = instance_dir / filepath
@@ -924,5 +962,18 @@ def run_scope_functions(
         output_path = fm_dir / 'scope_functions.json'
     output_path.write_text(json.dumps(result, indent=2))
     logger.info("Wrote %s", output_path)
+
+    # ── final summary ────────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print(f"SCOPE SUMMARY: {len(all_functions)} function(s) selected across {len(scope_files)} file(s)")
+    print("=" * 70)
+    files_seen: dict[str, list[dict]] = {}
+    for fn in all_functions:
+        files_seen.setdefault(fn['file'], []).append(fn)
+    for fpath, fns in files_seen.items():
+        print(f"  {fpath}")
+        for fn in fns:
+            print(f"    {fn['score']:>8.3f}  {fn['name']}  L{fn['lineno']}-{fn['end_lineno']}  [{fn['reason']}]")
+    print("=" * 70 + "\n")
 
     return result

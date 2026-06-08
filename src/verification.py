@@ -1,4 +1,9 @@
-from config import MAX_WORKERS, OPENCODE_BUG_VALIDATION_MODEL, OPENCODE_MODEL_PROVIDER
+from config import (
+    MAX_WORKERS,
+    OPENCODE_BUG_VALIDATION_MODEL,
+    OPENCODE_MODEL_PROVIDER,
+    BUG_VALIDATION_MAX_RETRIES,
+)
 from .parser import parse_input_function
 from .reasoner import reasoner, _parse_spec_conditions, _sanitize_strings
 from .file_utils import is_file_ready
@@ -29,9 +34,6 @@ EXT_TO_LANG = {
     ".ets": "ArkTS",
     ".cuh": "CUDA",
 }
-
-
-BUG_VALIDATION_MAX_RETRIES = 1
 
 
 def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, work_dir=None, poll_interval=2, spec_proc=None, spec_procs=None, already_processed=None):

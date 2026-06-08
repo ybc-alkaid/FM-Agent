@@ -20,3 +20,19 @@ MAX_SPC_ITER = 5
 GRANULARITY = 40
 MAX_WORKERS = 10
 OPENCODE_MAX_RETRIES = 5
+# Number of retries (in addition to the initial attempt) when validating a candidate bug;
+# the maximum number of bug-validation attempts per function is this value + 1.
+BUG_VALIDATION_MAX_RETRIES = int(os.environ.get("BUG_VALIDATION_MAX_RETRIES", "1"))
+
+# Function-selection scope knobs
+# Max number of functions retained per source file in the final scoped output.
+SCOPE_TOP_K = int(os.environ.get("SCOPE_TOP_K", "3"))
+# Run LLM re-ranking when a file has at least this many deduplicated functions.
+SCOPE_LLM_TRIGGER_FUNCS = int(os.environ.get("SCOPE_LLM_TRIGGER_FUNCS", "3"))
+# Number of candidate functions requested from the LLM during re-ranking.
+# Final output per file is still capped by SCOPE_TOP_K.
+SCOPE_LLM_TOP_K = int(os.environ.get("SCOPE_LLM_TOP_K", "3"))
+# Run LLM re-ranking when heuristic top score is below this threshold.
+SCOPE_LLM_CONFIDENCE_THRESHOLD = float(
+	os.environ.get("SCOPE_LLM_CONFIDENCE_THRESHOLD", "8.0")
+)
