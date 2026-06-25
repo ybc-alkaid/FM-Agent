@@ -107,6 +107,22 @@ _COMMON_EXTRA_KEYWORDS = {
 }
 
 
+def _fqn_to_source_basename(fqn):
+    """Derive the original source file basename from an FQN.
+
+    The second-to-last FQN part is the extracted-function directory name,
+    which was built from the source basename by replacing the last '.' with '-'.
+    Example: 'utils-py::process' -> 'utils-py' -> 'utils.py'
+             'src::utils-py::process' -> 'utils-py' -> 'utils.py'
+    """
+    parts = fqn.split("::")
+    module_part = parts[-2]
+    last_dash = module_part.rfind("-")
+    if last_dash < 0:
+        return module_part
+    return module_part[:last_dash] + "." + module_part[last_dash + 1:]
+
+
 def _detect_lang_from_ext(filepath):
     """Detect the language key from a file's extension."""
     base = os.path.basename(filepath)
@@ -285,6 +301,25 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
     callers_map = defaultdict(set)  # fqn -> set of caller fqns (within phase)
     all_callees_map = defaultdict(set)  # fqn -> set of callee fqns (any phase)
 
+    # Try codegraph backend for call edges; merge all supported languages.
+    # Falls back to regex scanning per-file when unavailable or language not
+    # yet in CODEGRAPH_SUPPORTED.
+    from src.extractors.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
+    _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
+    _cg_edges = {}  # {(caller_stem, caller_basename): {callee_stem}}
+    if _cg:
+        _cg_langs = {
+            _detect_lang_from_ext(fp)
+            for fp, _ in phase_files
+            if _detect_lang_from_ext(fp) in CODEGRAPH_SUPPORTED
+        }
+        for _lang in _cg_langs:
+            for key, callees in _cg.get_call_edges(_lang).items():
+                if key in _cg_edges:
+                    _cg_edges[key] |= callees
+                else:
+                    _cg_edges[key] = set(callees)
+
     for filepath, module_name in phase_files:
         fqn = fqn_map[filepath]
         lang_key = _detect_lang_from_ext(filepath)
@@ -292,13 +327,17 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
             continue
         keywords = _get_keywords_for_lang(lang_key)
 
-        try:
-            with open(filepath, "r", errors="replace") as f:
-                text = f.read()
-        except OSError:
-            continue
-
-        called_stems = _find_call_sites(text, lang_key, known_stems, keywords)
+        caller_stem = fqn.split("::")[-1]
+        if _cg_edges and lang_key in CODEGRAPH_SUPPORTED:
+            source_basename = _fqn_to_source_basename(fqn)
+            called_stems = _cg_edges.get((caller_stem, source_basename), set()) & known_stems
+        else:
+            try:
+                with open(filepath, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            called_stems = _find_call_sites(text, lang_key, known_stems, keywords)
 
         # Resolve stems to FQNs, excluding self
         for stem in called_stems:

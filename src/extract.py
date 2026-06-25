@@ -663,6 +663,16 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     with open(phases_path, 'r') as f:
         phases_data = json.load(f)
 
+    # Try codegraph backend; pre-fetch all functions indexed by abs filepath.
+    # Falls back to regex extraction per-file when codegraph is unavailable or
+    # the language is not yet in CODEGRAPH_SUPPORTED.
+    from src.extractors.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
+    _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
+    _cg_funcs = {}  # {abs_filepath: [(name, body)]}
+    if _cg:
+        for _lang in CODEGRAPH_SUPPORTED:
+            _cg_funcs.update(_cg.get_functions_by_file(_lang, proj_dir))
+
     # Build source file list from phases.json
     source_files = []
     for phase in phases_data.get("phases", []):
@@ -704,7 +714,10 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        funcs = extract_functions_from_file(src_path, lang_key)
+        if _cg and lang_key in CODEGRAPH_SUPPORTED and src_path in _cg_funcs:
+            funcs = _cg_funcs[src_path]
+        else:
+            funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
             logging.warning(f"No functions extracted from {src_rel}")
             continue
