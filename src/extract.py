@@ -6,7 +6,8 @@ import shutil
 import logging
 
 from src.file_utils import is_file_ready
-from src.languages.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
+from src.languages.codegraph import CodeGraphExtractor
+from src.languages.registry import REGISTRY
 
 LANG_CONFIG = {
     "cpp": {
@@ -666,12 +667,12 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
 
     # Try codegraph backend; pre-fetch all functions indexed by abs filepath.
     # Falls back to regex extraction per-file when codegraph is unavailable or
-    # the language is not yet in CODEGRAPH_SUPPORTED.
+    # the language has no entry in REGISTRY.
     _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
     _cg_funcs = {}  # {abs_filepath: [(name, body)]}
     if _cg:
-        for _lang in CODEGRAPH_SUPPORTED:
-            _cg_funcs.update(_cg.get_functions_by_file(_lang, proj_dir))
+        for _lang, _handler in REGISTRY.items():
+            _cg_funcs.update(_handler.batch_extract(_cg, proj_dir))
 
     # Build source file list from phases.json
     source_files = []
@@ -714,7 +715,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        if _cg and lang_key in CODEGRAPH_SUPPORTED and src_path in _cg_funcs:
+        if _cg and lang_key in REGISTRY and src_path in _cg_funcs:
             funcs = _cg_funcs[src_path]
         else:
             funcs = extract_functions_from_file(src_path, lang_key)
@@ -784,7 +785,7 @@ def _validate_extraction(extracted_dir, cg=None):
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
                 continue
-            if cg and lang_key in CODEGRAPH_SUPPORTED:
+            if cg and lang_key in REGISTRY:
                 continue
             fpath = os.path.join(root, fname)
             funcs = extract_functions_from_file(fpath, lang_key)

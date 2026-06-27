@@ -6,7 +6,8 @@ from pathlib import Path
 from collections import defaultdict
 
 from src.extract import EXT_TO_LANG, LANG_CONFIG
-from src.languages.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
+from src.languages.codegraph import CodeGraphExtractor
+from src.languages.registry import REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -304,17 +305,17 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
 
     # Try codegraph backend for call edges; merge all supported languages.
     # Falls back to regex scanning per-file when unavailable or language not
-    # yet in CODEGRAPH_SUPPORTED.
+    # yet in REGISTRY.
     _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
     _cg_edges = {}  # {(caller_stem, caller_basename): {callee_stem}}
     if _cg:
         _cg_langs = {
             _detect_lang_from_ext(fp)
             for fp, _ in phase_files
-            if _detect_lang_from_ext(fp) in CODEGRAPH_SUPPORTED
+            if _detect_lang_from_ext(fp) in REGISTRY
         }
         for _lang in _cg_langs:
-            for key, callees in _cg.get_call_edges(_lang).items():
+            for key, callees in REGISTRY[_lang].call_edges(_cg).items():
                 if key in _cg_edges:
                     _cg_edges[key] |= callees
                 else:
@@ -328,7 +329,7 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
         keywords = _get_keywords_for_lang(lang_key)
 
         caller_stem = fqn.split("::")[-1]
-        if _cg_edges and lang_key in CODEGRAPH_SUPPORTED:
+        if _cg_edges and lang_key in REGISTRY:
             source_basename = _fqn_to_source_basename(fqn)
             called_stems = _cg_edges.get((caller_stem, source_basename), set()) & known_stems
         else:
