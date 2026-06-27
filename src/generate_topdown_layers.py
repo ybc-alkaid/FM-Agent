@@ -109,20 +109,6 @@ _COMMON_EXTRA_KEYWORDS = {
 }
 
 
-def _fqn_to_source_basename(fqn):
-    """Derive the original source file basename from an FQN.
-
-    The second-to-last FQN part is the extracted-function directory name,
-    which was built from the source basename by replacing the last '.' with '-'.
-    Example: 'utils-py::process' -> 'utils-py' -> 'utils.py'
-             'src::utils-py::process' -> 'utils-py' -> 'utils.py'
-    """
-    parts = fqn.split("::")
-    module_part = parts[-2]
-    last_dash = module_part.rfind("-")
-    if last_dash < 0:
-        return module_part
-    return module_part[:last_dash] + "." + module_part[last_dash + 1:]
 
 
 def _detect_lang_from_ext(filepath):
@@ -330,8 +316,8 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
 
         caller_stem = fqn.split("::")[-1]
         if _cg_edges and lang_key in REGISTRY:
-            source_basename = _fqn_to_source_basename(fqn)
-            called_stems = _cg_edges.get((caller_stem, source_basename), set()) & known_stems
+            caller_module = fqn.split("::")[-2]
+            called_stems = _cg_edges.get((caller_stem, caller_module), set()) & known_stems
         else:
             try:
                 with open(filepath, "r", errors="replace") as f:

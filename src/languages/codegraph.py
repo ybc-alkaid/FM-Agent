@@ -133,7 +133,10 @@ class CodeGraphExtractor:
 
         result = defaultdict(set)
         for caller, caller_file, callee in rows:
-            key = (caller, os.path.basename(caller_file))
+            base = os.path.basename(caller_file)
+            last_dot = base.rfind(".")
+            dashed = base[:last_dot] + "-" + base[last_dot + 1:] if last_dot > 0 else base
+            key = (caller, dashed)
             result[key].add(callee)
         return dict(result)
 
