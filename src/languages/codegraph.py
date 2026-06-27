@@ -140,6 +140,17 @@ class CodeGraphExtractor:
             result[key].add(callee)
         return dict(result)
 
+    def get_all_functions(self, lang_keys, proj_dir: str) -> dict:
+        """Return merged function extraction results for multiple languages.
+
+        Equivalent to calling get_functions_by_file for each lang_key and
+        merging into a single {abs_filepath: [(name, body)]} dict.
+        """
+        result = {}
+        for lang_key in lang_keys:
+            result.update(self.get_functions_by_file(lang_key, proj_dir))
+        return result
+
     def get_all_call_edges(self, lang_keys) -> dict:
         """Return merged call edges for multiple languages.
 

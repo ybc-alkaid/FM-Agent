@@ -671,8 +671,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
     _cg_funcs = {}  # {abs_filepath: [(name, body)]}
     if _cg:
-        for _lang, _handler in REGISTRY.items():
-            _cg_funcs.update(_handler.batch_extract(_cg, proj_dir))
+        _cg_funcs = _cg.get_all_functions(REGISTRY.keys(), proj_dir)
 
     # Build source file list from phases.json
     source_files = []
