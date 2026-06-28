@@ -22,15 +22,15 @@ from collections import defaultdict
 #   codegraph.json file at the project root — codegraph will then parse .cu files
 #   using the C++ grammar. This workaround has not been verified.
 _CG_LANG = {
-    "python":     "python",
-    "go":         "go",
-    "rust":       "rust",
-    "c":          "c",
-    "cpp":        "cpp",
-    "cuda":       "cpp",  # .cu is not natively indexed by codegraph; kept for future use
-    "java":       "java",
-    "javascript": "javascript",
-    "typescript": "typescript",
+    "python":     ["python"],
+    "go":         ["go"],
+    "rust":       ["rust"],
+    "c":          ["c"],
+    "cpp":        ["cpp"],
+    "cuda":       ["cpp"],  # .cu is not natively indexed by codegraph; kept for future use
+    "java":       ["java"],
+    "javascript": ["javascript", "jsx"],  # codegraph stores .jsx files as language='jsx'
+    "typescript": ["typescript", "tsx"],  # codegraph stores .tsx files as language='tsx'
 }
 
 
@@ -64,20 +64,21 @@ class CodeGraphExtractor:
         codegraph can be resolved to absolute paths for opening and for dict
         key lookup in run_extraction.
         """
-        cg_lang = _CG_LANG.get(lang_key)
-        if not cg_lang:
+        cg_langs = _CG_LANG.get(lang_key)
+        if not cg_langs:
             return {}
 
         conn = sqlite3.connect(self._db)
         cur = conn.cursor()
+        placeholders = ",".join("?" * len(cg_langs))
         cur.execute(
-            """
+            f"""
             SELECT name, file_path, start_line, end_line
             FROM nodes
-            WHERE kind IN ('function', 'method') AND language = ?
+            WHERE kind IN ('function', 'method') AND language IN ({placeholders})
             ORDER BY file_path, start_line
             """,
-            (cg_lang,),
+            cg_langs,
         )
         rows = cur.fetchall()
         conn.close()
@@ -115,21 +116,22 @@ class CodeGraphExtractor:
         caller_basename is os.path.basename(caller_file_path), used to disambiguate
         same-name functions defined in different files.
         """
-        cg_lang = _CG_LANG.get(lang_key)
-        if not cg_lang:
+        cg_langs = _CG_LANG.get(lang_key)
+        if not cg_langs:
             return {}
 
         conn = sqlite3.connect(self._db)
         cur = conn.cursor()
+        placeholders = ",".join("?" * len(cg_langs))
         cur.execute(
-            """
+            f"""
             SELECT s.name, s.file_path, t.name
             FROM edges e
             JOIN nodes s ON e.source = s.id
             JOIN nodes t ON e.target = t.id
-            WHERE e.kind = 'calls' AND s.language = ?
+            WHERE e.kind = 'calls' AND s.language IN ({placeholders})
             """,
-            (cg_lang,),
+            cg_langs,
         )
         rows = cur.fetchall()
         conn.close()
