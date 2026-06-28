@@ -17,14 +17,17 @@ from collections import defaultdict
 # Maps FM-Agent lang_key → the language string stored in codegraph's SQLite
 # nodes.language column. Only includes languages that codegraph actually supports.
 # ArkTS is omitted (not supported by codegraph).
-# CUDA maps to "c" because codegraph treats .cu files as C.
+# CUDA: .cu is not in codegraph's built-in extension list and will not be indexed.
+#   To enable partial CUDA support, add {"extensions": {".cu": "cpp"}} to a
+#   codegraph.json file at the project root — codegraph will then parse .cu files
+#   using the C++ grammar. This workaround has not been verified.
 _CG_LANG = {
     "python":     "python",
     "go":         "go",
     "rust":       "rust",
     "c":          "c",
     "cpp":        "cpp",
-    "cuda":       "c",
+    "cuda":       "cpp",  # .cu is not natively indexed by codegraph; kept for future use
     "java":       "java",
     "javascript": "javascript",
     "typescript": "typescript",
@@ -140,28 +143,6 @@ class CodeGraphExtractor:
             result[key].add(callee)
         return dict(result)
 
-    def get_all_functions(self, lang_keys, proj_dir: str) -> dict:
-        """Return merged function extraction results for multiple languages.
-
-        Equivalent to calling get_functions_by_file for each lang_key and
-        merging into a single {abs_filepath: [(name, body)]} dict.
-        """
-        result = {}
-        for lang_key in lang_keys:
-            result.update(self.get_functions_by_file(lang_key, proj_dir))
-        return result
-
-    def get_all_call_edges(self, lang_keys) -> dict:
-        """Return merged call edges for multiple languages.
-
-        Equivalent to calling get_call_edges for each lang_key and unioning
-        the results into a single {(caller_stem, caller_module): {callee_stems}} dict.
-        """
-        result = {}
-        for lang_key in lang_keys:
-            for key, callees in self.get_call_edges(lang_key).items():
-                result.setdefault(key, set()).update(callees)
-        return result
 
 
 def try_codegraph_init(proj_dir: str) -> None:

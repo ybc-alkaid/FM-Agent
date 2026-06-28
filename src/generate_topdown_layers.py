@@ -6,8 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from src.extract import EXT_TO_LANG, LANG_CONFIG
-from src.languages.codegraph import CodeGraphExtractor
-from src.languages.registry import REGISTRY
+from src.languages.registry import call_edges_all
 
 
 # ---------------------------------------------------------------------------
@@ -289,17 +288,8 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
     callers_map = defaultdict(set)  # fqn -> set of caller fqns (within phase)
     all_callees_map = defaultdict(set)  # fqn -> set of callee fqns (any phase)
 
-    # Try codegraph backend for call edges; falls back to regex per-file when
-    # unavailable or the language is not yet in REGISTRY.
-    _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
-    _cg_edges = {}
-    if _cg:
-        _cg_langs = {
-            _detect_lang_from_ext(fp)
-            for fp, _ in phase_files
-            if _detect_lang_from_ext(fp) in REGISTRY
-        }
-        _cg_edges = _cg.get_all_call_edges(_cg_langs)
+    _phase_langs = {_detect_lang_from_ext(fp) for fp, _ in phase_files if _detect_lang_from_ext(fp)}
+    _backend_edges, _backend_langs = call_edges_all(proj_dir, _phase_langs)
 
     for filepath, module_name in phase_files:
         fqn = fqn_map[filepath]
@@ -309,9 +299,9 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
         keywords = _get_keywords_for_lang(lang_key)
 
         caller_stem = fqn.split("::")[-1]
-        if _cg_edges and lang_key in REGISTRY:
+        if lang_key in _backend_langs:
             caller_module = fqn.split("::")[-2]
-            called_stems = _cg_edges.get((caller_stem, caller_module), set()) & known_stems
+            called_stems = _backend_edges.get((caller_stem, caller_module), set()) & known_stems
         else:
             try:
                 with open(filepath, "r", errors="replace") as f:

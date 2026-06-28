@@ -6,8 +6,7 @@ import shutil
 import logging
 
 from src.file_utils import is_file_ready
-from src.languages.codegraph import CodeGraphExtractor
-from src.languages.registry import REGISTRY
+from src.languages.registry import batch_extract_all
 
 LANG_CONFIG = {
     "cpp": {
@@ -665,13 +664,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     with open(phases_path, 'r') as f:
         phases_data = json.load(f)
 
-    # Try codegraph backend; pre-fetch all functions indexed by abs filepath.
-    # Falls back to regex extraction per-file when codegraph is unavailable or
-    # the language has no entry in REGISTRY.
-    _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
-    _cg_funcs = {}  # {abs_filepath: [(name, body)]}
-    if _cg:
-        _cg_funcs = _cg.get_all_functions(REGISTRY.keys(), proj_dir)
+    _backend_funcs, _backend_langs = batch_extract_all(proj_dir)
 
     # Build source file list from phases.json
     source_files = []
@@ -714,8 +707,8 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        if _cg and lang_key in REGISTRY and src_path in _cg_funcs:
-            funcs = _cg_funcs[src_path]
+        if src_path in _backend_funcs:
+            funcs = _backend_funcs[src_path]
         else:
             funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
@@ -747,7 +740,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         return written, skipped
 
     # --- Validation (Step 2) ---
-    validation_failures = _validate_extraction(output_base, cg=_cg)
+    validation_failures = _validate_extraction(output_base, backend_langs=_backend_langs)
     if validation_failures:
         logging.warning(
             f"Validation: {len(validation_failures)} file(s) do not contain exactly one function."
@@ -766,14 +759,13 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     return written, skipped
 
 
-def _validate_extraction(extracted_dir, cg=None):
+def _validate_extraction(extracted_dir, backend_langs=None):
     """Re-parse every extracted file and verify each contains exactly one function.
 
-    When cg is provided, files for codegraph-supported languages are skipped:
-    codegraph writes exactly one function body per file by construction (one DB
-    node → one line-range slice → one write), so regex re-parsing adds no safety
-    and produces false negatives for forms the regex cannot recognise (async def,
-    class methods, arrow functions).
+    Files for languages that returned data from their REGISTRY backend are skipped:
+    those backends write exactly one function body per file by construction, so
+    regex re-parsing adds no safety and produces false negatives for forms the
+    regex cannot recognise (async def, class methods, arrow functions).
 
     Returns a list of (file_path, function_count) for files that fail validation.
     """
@@ -784,7 +776,7 @@ def _validate_extraction(extracted_dir, cg=None):
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
                 continue
-            if cg and lang_key in REGISTRY:
+            if backend_langs and lang_key in backend_langs:
                 continue
             fpath = os.path.join(root, fname)
             funcs = extract_functions_from_file(fpath, lang_key)
